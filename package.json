@@ -1,0 +1,13 @@
+{
+  "name": "gifted-prep",
+  "private": true,
+  "type": "module",
+  "description": "Static Hebrew practice site. No build step and no runtime dependencies.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tools/test_progress.mjs && node tools/validate.mjs --runs 500",
+    "e2e": "node tools/e2e/e2e.mjs"
+  }
+}
