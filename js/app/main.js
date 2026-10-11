@@ -1,10 +1,13 @@
-// App shell: hash routing between screens, the practice session flow and the
-// test simulation flow. All learning logic lives in progress.js; this file
-// only renders and wires events.
+// App shell: hash routing between screens, the profile chooser, the practice
+// session flow and the test simulation flow. Learning logic lives in
+// progress.js, children and saving in profiles.js and store.js; this file only
+// renders and wires events.
 
 import { topics, loadErrors } from '../generators/index.js';
 import { createRng } from '../core/random.js';
-import { Progress, safeLocalStorage, dayKey, genderText, SETTING_LIMITS } from './progress.js';
+import { dayKey, genderText, SETTING_LIMITS } from './progress.js';
+import { Store, safeLocalStorage, NOOP_SYNC } from './store.js';
+import { Profiles, AVATARS, MAX_PROFILES, parseProgressFile } from './profiles.js';
 import { h, fill, multiline, bidiText, percent } from './dom.js';
 import { pickPraise, ENCOURAGE, TIMEOUT, RETRY_NOTE, LEVEL_UP, pick } from './phrases.js';
 import { confetti, playSound, watchHebrewVoice, speak, stopSpeaking, prefersReducedMotion } from './effects.js';
@@ -17,22 +20,27 @@ const TIMER_OPTIONS = [30, 45, 60, 90];
 const TEST_ADVANCE_MS = 700;
 const TEST_TIMEOUT_ADVANCE_MS = 1500;
 
-const storage = safeLocalStorage();
-const progress = new Progress({ topics, storage });
+const store = new Store({ storage: safeLocalStorage(), sync: NOOP_SYNC });
+const profiles = new Profiles({ topics, store }).init();
 const app = document.getElementById('app');
 
+// The active child's Progress; null only before the first child is created.
+let progress = profiles.active;
 let session = null;
 let parentsUnlocked = false;
+let parentsProfileId = null;
 let speechAvailable = false;
 let timerHandle = null;
 
-const sound = (name) => playSound(name, progress.settings.sound);
-const t = (m, f) => (progress.settings.gender === 'girl' ? f : m);
-const say = (text) => genderText(text, progress.settings.gender);
+const gender = () => progress?.settings.gender ?? 'boy';
+const sound = (name) => playSound(name, progress?.settings.sound ?? true);
+const t = (m, f) => (gender() === 'girl' ? f : m);
+const say = (text) => genderText(text, gender());
 
 // ---------------------------------------------------------------- routing
 
 const SCREENS = {
+  who: renderWho,
   welcome: renderWelcome,
   home: renderHome,
   practice: renderPractice,
@@ -63,9 +71,12 @@ function sessionScreen() {
 function render() {
   clearTimer();
   stopSpeaking();
+  closeDialogs();
   let name = location.hash.slice(1) || 'home';
   if (!SCREENS[name]) name = 'home';
-  if (!progress.settings.name) name = 'welcome';
+  if (!profiles.count) name = 'welcome';
+  else if (name === 'welcome' && !profiles.canAdd) name = 'who';
+  else if (!progress && name !== 'welcome') name = 'who';
   if (SESSION_SCREENS.has(name)) {
     const allowed = sessionScreen();
     if (name !== allowed && !(name === 'review' && allowed === 'results' && session.mistakes.length)) name = allowed;
@@ -102,13 +113,61 @@ function counterChip(n, total) {
     h('span', { class: 'sr-only' }, `${n} מתוך ${total}`));
 }
 
+// ---------------------------------------------------------------- profiles
+
+function avatarBadge(entry, size) {
+  return h('span', { class: `avatar avatar-${size}`, style: { backgroundColor: entry.color }, 'aria-hidden': 'true' },
+    entry.avatar);
+}
+
+// Grid of the avatar emoji; `value` is the picked one.
+function avatarPicker(initial) {
+  const picker = { value: initial };
+  const buttons = AVATARS.map((a) => h('button', { class: 'avatar-btn', type: 'button', 'data-avatar': a,
+    'aria-pressed': String(a === initial), 'aria-label': `דמות ${a}`, onclick: () => choose(a) }, a));
+  function choose(a) {
+    picker.value = a;
+    for (const b of buttons) b.setAttribute('aria-pressed', String(b.dataset.avatar === a));
+  }
+  picker.el = h('div', { class: 'avatar-choice', role: 'group', 'aria-label': 'דמות' }, buttons);
+  return picker;
+}
+
+function useProfile(id) {
+  progress = profiles.switchTo(id);
+  go('home');
+}
+
+function renderWho() {
+  const cards = profiles.list.map((e) => h('button', { class: 'profile-card', type: 'button', 'data-profile': e.id,
+    'aria-current': e.id === profiles.activeId ? 'true' : null, onclick: () => useProfile(e.id) },
+  avatarBadge(e, 'lg'),
+  h('span', { class: 'profile-name' }, e.name),
+  h('span', { class: 'profile-points' }, h('span', { 'aria-hidden': 'true' }, '⭐ '), String(profiles.pointsOf(e.id)),
+    h('span', { class: 'sr-only' }, ' נקודות'))));
+  const add = profiles.canAdd
+    ? h('button', { class: 'profile-card profile-add', type: 'button', onclick: () => go('welcome') },
+      h('span', { class: 'avatar avatar-lg avatar-add', 'aria-hidden': 'true' }, '+'),
+      h('span', { class: 'profile-name' }, 'הוספת ילד/ה'))
+    : null;
+  return screen('who',
+    h('h1', { class: 'who-title', tabindex: '-1', 'data-autofocus': true }, 'מי מתאמן היום?'),
+    h('div', { class: 'profile-grid' }, cards, add),
+    h('div', { class: 'who-actions' },
+      h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => go('parents') },
+        h('span', { 'aria-hidden': 'true' }, '👨‍👩‍👧 '), 'אזור הורים')));
+}
+
 // ---------------------------------------------------------------- welcome
 
+// First visit, or a new child added from the chooser.
 function renderWelcome() {
   let chosen = null;
+  const adding = profiles.count > 0;
   const input = h('input', { class: 'input welcome-input', type: 'text', id: 'welcome-name', maxlength: '30',
     autocomplete: 'off', enterkeyhint: 'done', 'aria-labelledby': 'welcome-title' });
   const msg = h('p', { class: 'welcome-msg', 'aria-live': 'polite' });
+  const avatars = avatarPicker(profiles.suggestAvatar());
 
   const genderButton = (value, icon, label) => h('button', { class: 'gender-btn', type: 'button',
     'data-gender': value, 'aria-pressed': 'false', onclick: () => choose(value) },
@@ -134,16 +193,28 @@ function renderWelcome() {
       buttons[0].focus();
       return;
     }
-    progress.updateSettings({ name, gender: chosen });
+    try {
+      profiles.create({ name, gender: chosen, avatar: avatars.value });
+    } catch (err) {
+      msg.textContent = err.message;
+      return;
+    }
+    progress = profiles.active;
     go('home');
   };
 
   return screen('welcome',
+    adding
+      ? h('header', { class: 'topbar' },
+        h('button', { class: 'btn btn-ghost btn-back', type: 'button', onclick: () => go('who') }, '→ חזרה'))
+      : null,
     h('form', { class: 'card welcome-card', onsubmit: submit, novalidate: true },
       h('span', { class: 'welcome-wave', 'aria-hidden': 'true' }, '👋'),
       h('h1', { class: 'welcome-title', id: 'welcome-title', tabindex: '-1', 'data-autofocus': true }, 'שלום! איך קוראים לך?'),
       input,
       h('div', { class: 'gender-choice', role: 'group', 'aria-label': 'בן או בת?' }, buttons),
+      h('p', { class: 'avatar-title', id: 'avatar-title' }, 'בוחרים דמות:'),
+      avatars.el,
       h('button', { class: 'btn btn-primary btn-huge', type: 'submit' }, 'יאללה, מתחילים! 🚀'),
       msg));
 }
@@ -188,15 +259,23 @@ function renderHome() {
         h('span', { 'aria-hidden': 'true' }, '⏱️ '), 'להתחיל מבחן')),
   ];
 
+  const me = profiles.entry(profiles.activeId);
+
   return screen('home',
     h('header', { class: 'home-head' },
-      h('h1', { class: 'greeting', tabindex: '-1', 'data-autofocus': true }, s.name ? `שלום ${s.name}!` : 'שלום!'),
+      h('h1', { class: 'greeting', tabindex: '-1', 'data-autofocus': true },
+        h('button', { class: 'who-btn', type: 'button', title: 'החלפת ילד/ה', onclick: () => go('who') },
+          avatarBadge(me, 'md'),
+          h('span', { class: 'greeting-text' }, `שלום ${s.name}!`))),
       h('div', { class: 'chips' },
         statChip('⭐', progress.state.points, 'נקודות'),
         statChip('🔥', streak, streak === 1 ? 'יום ברצף' : 'ימים ברצף'))),
-    h('p', { class: 'home-sub' }, progress.practicedToday()
-      ? 'איזה כיף שחזרת! עוד סיבוב?'
-      : t('מוכן לאתגר של היום?', 'מוכנה לאתגר של היום?')),
+    h('div', { class: 'home-subrow' },
+      h('p', { class: 'home-sub' }, progress.practicedToday()
+        ? 'איזה כיף שחזרת! עוד סיבוב?'
+        : t('מוכן לאתגר של היום?', 'מוכנה לאתגר של היום?')),
+      h('button', { class: 'btn btn-ghost btn-switch', type: 'button', onclick: () => go('who') },
+        h('span', { 'aria-hidden': 'true' }, '🔄 '), 'החלפת ילד/ה')),
     topics.length === 0
       ? h('p', { class: 'notice' }, t('אין כרגע שאלות זמינות. בקש מאבא או מאמא לבדוק.',
         'אין כרגע שאלות זמינות. בקשי מאבא או מאמא לבדוק.'))
@@ -728,23 +807,28 @@ function formatDate(ts) {
   return `${d}/${m}/${y.slice(2)}`;
 }
 
+// Stats and settings are for one child at a time (`parentsProfileId`), which
+// starts as the active child and is picked with the switcher.
 function renderParents() {
-  const st = progress.state;
+  if (!profiles.entry(parentsProfileId)) parentsProfileId = profiles.activeId;
+  const child = profiles.entry(parentsProfileId);
+  const p = profiles.progressFor(parentsProfileId);
+  const st = p.state;
   const totals = st.totals;
   const daysPracticed = Object.values(st.days).filter((d) => d.attempts > 0).length;
 
   const overview = h('div', { class: 'card' },
-    h('h2', {}, 'תמונת מצב'),
+    h('h2', {}, `תמונת מצב של ${child.name}`),
     h('div', { class: 'stats-grid' },
       stat('שאלות', totals.attempts),
       stat('דיוק כללי', percent(totals.attempts ? totals.correct / totals.attempts : null)),
       stat('נקודות', st.points),
-      stat('ימים ברצף', progress.streak()),
+      stat('ימים ברצף', p.streak()),
       stat('ימי תרגול', daysPracticed),
       stat('תיקונים אחרי טעות', totals.retriesFixed),
       stat('מבחנים לדוגמה', st.testHistory.length)));
 
-  const weakest = progress.weakestSkills(3);
+  const weakest = p.weakestSkills(3);
   const weakCard = h('div', { class: 'card' },
     h('h2', {}, 'הכי כדאי לחזק'),
     weakest.length
@@ -753,7 +837,7 @@ function renderParents() {
       : h('p', {}, 'עוד אין מספיק נתונים.'));
 
   const topicCards = topics.map((topic) => {
-    const sum = progress.topicSummary(topic);
+    const sum = p.topicSummary(topic);
     return h('div', { class: 'card' },
       h('h2', {}, `${topic.icon} ${topic.name}`),
       h('p', {}, `${sum.attempts} שאלות, דיוק ${percent(sum.accuracy)}, שליטה ממוצעת ${percent(sum.mastery)}`),
@@ -771,7 +855,7 @@ function renderParents() {
             h('td', {}, formatDate(s.lastPracticed))))))));
   });
 
-  const hist = progress.history(14);
+  const hist = p.history(14);
   const maxAttempts = Math.max(1, ...hist.map((d) => d.attempts));
   const chart = h('div', { class: 'card' },
     h('h2', {}, 'תרגול ב-14 הימים האחרונים'),
@@ -799,13 +883,87 @@ function renderParents() {
   return screen('parents',
     topBar('אזור הורים'),
     errors,
+    renderChildrenCard(),
+    childSwitcher(child.id),
     overview,
-    renderTestHistoryCard(),
+    renderTestHistoryCard(p),
     weakCard,
     chart,
     topicCards,
-    renderSettingsCard(),
-    renderDataCard());
+    renderSettingsCard(p, child),
+    renderDataCard(p, child));
+}
+
+function renderChildrenCard() {
+  const rows = profiles.list.map((e) => h('li', { class: 'child-row', 'data-profile': e.id },
+    avatarBadge(e, 'sm'),
+    h('span', { class: 'child-info' },
+      h('b', { class: 'child-name' }, e.name),
+      h('span', { class: 'child-meta' }, `${e.gender === 'girl' ? 'בת' : 'בן'} · ⭐ ${profiles.pointsOf(e.id)}`)),
+    h('span', { class: 'child-actions' },
+      h('button', { class: 'btn btn-secondary btn-small btn-edit', type: 'button', 'aria-label': `עריכה: ${e.name}`,
+        onclick: () => editChild(e.id) }, h('span', { 'aria-hidden': 'true' }, '✏️'), h('span', { class: 'btn-label', 'aria-hidden': 'true' }, ' עריכה')),
+      h('button', { class: 'btn btn-danger btn-small btn-delete', type: 'button', 'aria-label': `מחיקה: ${e.name}`,
+        onclick: () => deleteChild(e.id) }, h('span', { 'aria-hidden': 'true' }, '🗑️'), h('span', { class: 'btn-label', 'aria-hidden': 'true' }, ' מחיקה')))));
+  return h('div', { class: 'card children' },
+    h('h2', {}, 'ילדים'),
+    h('ul', { class: 'child-list' }, rows),
+    profiles.canAdd
+      ? h('button', { class: 'btn btn-secondary btn-add-child', type: 'button', onclick: () => go('welcome') }, '➕ הוספת ילד/ה')
+      : h('p', { class: 'muted' }, `אפשר עד ${MAX_PROFILES} ילדים במכשיר אחד.`));
+}
+
+function childSwitcher(currentId) {
+  if (profiles.count < 2) return null;
+  return h('div', { class: 'child-switcher', role: 'group', 'aria-label': 'הנתונים של' },
+    h('span', { class: 'switcher-label' }, 'הנתונים של:'),
+    profiles.list.map((e) => h('button', { class: 'switch-chip', type: 'button', 'data-profile': e.id,
+      'aria-pressed': String(e.id === currentId), onclick: () => { parentsProfileId = e.id; render(); } },
+    avatarBadge(e, 'xs'), h('span', {}, e.name))));
+}
+
+async function editChild(id) {
+  const e = profiles.entry(id);
+  const name = h('input', { class: 'input', type: 'text', id: 'edit-name', value: e.name, maxlength: '30', autocomplete: 'off' });
+  const genderSelect = h('select', { class: 'input', id: 'edit-gender' },
+    [['boy', 'בן (לשון זכר)'], ['girl', 'בת (לשון נקבה)']].map(([value, label]) =>
+      h('option', { value, selected: e.gender === value }, label)));
+  const avatars = avatarPicker(e.avatar);
+  const choice = await openDialog({
+    title: `עריכה: ${e.name}`,
+    body: [
+      h('label', { class: 'field' }, h('span', {}, 'שם'), name),
+      h('label', { class: 'field' }, h('span', {}, 'פנייה לילד/ה'), genderSelect),
+      h('div', { class: 'field' }, h('span', {}, 'דמות'), avatars.el),
+    ],
+    actions: [
+      { label: 'ביטול', value: null, className: 'btn-ghost' },
+      { label: 'שמירה', value: 'save', className: 'btn-primary',
+        validate: () => (name.value.trim() ? null : 'השם לא יכול להיות ריק') },
+    ],
+  });
+  if (choice !== 'save') return;
+  profiles.update(id, { name: name.value, gender: genderSelect.value, avatar: avatars.value });
+  showToast('נשמר ✓');
+  render();
+}
+
+async function deleteChild(id) {
+  const e = profiles.entry(id);
+  const choice = await openDialog({
+    title: `למחוק את ${e.name}?`,
+    body: [h('p', {}, `כל ההתקדמות, הנקודות וההישגים של ${e.name} יימחקו מהמכשיר הזה. אי אפשר לבטל.`)],
+    actions: [
+      { label: 'ביטול', value: null, className: 'btn-secondary' },
+      { label: 'כן, למחוק', value: 'delete', className: 'btn-danger btn-confirm-delete' },
+    ],
+  });
+  if (choice !== 'delete') return;
+  profiles.remove(id);
+  progress = profiles.active;
+  showToast(`${e.name} נמחק/ה מהמכשיר`);
+  if (!profiles.count) go('welcome');
+  else render();
 }
 
 function stat(label, value) {
@@ -815,8 +973,8 @@ function stat(label, value) {
 const TEST_CHART_COUNT = 10;
 const TEST_TABLE_COUNT = 20;
 
-function renderTestHistoryCard() {
-  const list = progress.testHistory();
+function renderTestHistoryCard(p) {
+  const list = p.testHistory();
   if (!list.length) {
     return h('div', { class: 'card test-history' },
       h('h2', {}, 'מבחנים לדוגמה'),
@@ -855,69 +1013,61 @@ function renderTestHistoryCard() {
     table);
 }
 
-function selectField(label, key, options, suffix) {
-  const current = progress.settings[key];
+function selectField(p, label, key, options, suffix) {
+  const current = p.settings[key];
   const opts = options.includes(current) ? options : [...options, current].sort((a, b) => a - b);
   const [lo, hi] = SETTING_LIMITS[key];
   return h('label', { class: 'field' }, h('span', {}, label),
-    h('select', { class: 'input', onchange: (e) => saveSetting({ [key]: Number(e.target.value) }) },
+    h('select', { class: 'input', onchange: (e) => saveSetting(p, { [key]: Number(e.target.value) }) },
       opts.filter((o) => o >= lo && o <= hi).map((o) => h('option', { value: String(o), selected: o === current }, `${o} ${suffix}`))));
 }
 
-function checkField(label, key) {
+function checkField(p, label, key) {
   return h('label', { class: 'field field-check' },
-    h('input', { type: 'checkbox', checked: progress.settings[key],
-      onchange: (e) => saveSetting({ [key]: e.target.checked }) }),
+    h('input', { type: 'checkbox', checked: p.settings[key],
+      onchange: (e) => saveSetting(p, { [key]: e.target.checked }) }),
     h('span', {}, label));
 }
 
-function saveSetting(patch) {
-  progress.updateSettings(patch);
+function saveSetting(p, patch) {
+  p.updateSettings(patch);
   showToast('נשמר ✓');
 }
 
-function renderSettingsCard() {
-  const name = h('input', { class: 'input', type: 'text', value: progress.settings.name, maxlength: '30',
-    onchange: (e) => {
-      if (!e.target.value.trim()) {
-        e.target.value = progress.settings.name;
-        showToast('השם לא יכול להיות ריק');
-        return;
-      }
-      saveSetting({ name: e.target.value });
-    } });
-  const gender = h('select', { class: 'input', onchange: (e) => saveSetting({ gender: e.target.value }) },
-    [['boy', 'בן (לשון זכר)'], ['girl', 'בת (לשון נקבה)']].map(([value, label]) =>
-      h('option', { value, selected: progress.settings.gender === value }, label)));
+// Settings belong to each child: children differ in pace and in how much
+// time pressure they handle.
+function renderSettingsCard(p, child) {
   return h('div', { class: 'card' },
-    h('h2', {}, 'הגדרות'),
+    h('h2', {}, `הגדרות של ${child.name}`),
     h('div', { class: 'settings' },
-      h('label', { class: 'field' }, h('span', {}, 'שם'), name),
-      h('label', { class: 'field' }, h('span', {}, 'פנייה לילד/ה'), gender),
-      selectField('שאלות בסיבוב אימון', 'sessionLength', SESSION_LENGTH_OPTIONS, 'שאלות'),
-      selectField('שאלות במבחן לדוגמה', 'examLength', EXAM_LENGTH_OPTIONS, 'שאלות'),
-      selectField('זמן לשאלה', 'timerSeconds', TIMER_OPTIONS, 'שניות'),
-      checkField('טיימר גם באימון', 'timedDefault'),
-      checkField('צלילים', 'sound')));
+      selectField(p, 'שאלות בסיבוב אימון', 'sessionLength', SESSION_LENGTH_OPTIONS, 'שאלות'),
+      selectField(p, 'שאלות במבחן לדוגמה', 'examLength', EXAM_LENGTH_OPTIONS, 'שאלות'),
+      selectField(p, 'זמן לשאלה', 'timerSeconds', TIMER_OPTIONS, 'שניות'),
+      checkField(p, 'טיימר גם באימון', 'timedDefault'),
+      checkField(p, 'צלילים', 'sound')));
 }
 
-function renderDataCard() {
+function renderDataCard(p, child) {
   const fileInput = h('input', { type: 'file', accept: 'application/json,.json', class: 'sr-only', id: 'import-file',
-    onchange: (e) => importFile(e.target.files?.[0]) });
+    onchange: (e) => {
+      importFile(e.target.files?.[0]);
+      e.target.value = '';
+    } });
   return h('div', { class: 'card' },
     h('h2', {}, 'גיבוי והעברה בין מכשירים'),
-    h('p', {}, 'ההתקדמות נשמרת בדפדפן הזה בלבד. כדי להעביר למכשיר אחר: שמרו קובץ כאן וטענו אותו שם.'),
+    h('p', {}, 'ההתקדמות של כל הילדים נשמרת בדפדפן הזה בלבד. כדי להעביר למכשיר אחר: שמרו קובץ כאן וטענו אותו שם.'),
     h('div', { class: 'row' },
-      h('button', { class: 'btn btn-secondary', type: 'button', onclick: exportFile }, '⬇️ שמירת קובץ התקדמות'),
-      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => fileInput.click() }, '⬆️ טעינת קובץ התקדמות'),
+      h('button', { class: 'btn btn-secondary btn-export', type: 'button', onclick: exportFile }, '⬇️ שמירת קובץ התקדמות'),
+      h('button', { class: 'btn btn-secondary btn-import', type: 'button', onclick: () => fileInput.click() }, '⬆️ טעינת קובץ התקדמות'),
       fileInput),
-    storage ? null : h('p', { class: 'notice' }, 'שימו לב: הדפדפן חוסם שמירה מקומית, ההתקדמות תימחק בסגירת הדף. מומלץ לשמור קובץ.'),
+    profiles.persistent ? null : h('p', { class: 'notice' }, 'שימו לב: הדפדפן חוסם שמירה מקומית, ההתקדמות תימחק בסגירת הדף. מומלץ לשמור קובץ.'),
     h('h2', {}, 'איפוס'),
-    h('button', { class: 'btn btn-danger', type: 'button', onclick: resetProgress }, '🗑️ איפוס כל ההתקדמות'));
+    h('button', { class: 'btn btn-danger btn-reset', type: 'button', onclick: () => resetProgress(p, child) },
+      `🗑️ איפוס ההתקדמות של ${child.name}`));
 }
 
 function exportFile() {
-  const blob = new Blob([progress.exportData()], { type: 'application/json' });
+  const blob = new Blob([profiles.exportAll()], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = h('a', { href: url, download: `gifted-prep-progress-${dayKey(Date.now())}.json` });
   document.body.appendChild(a);
@@ -929,10 +1079,20 @@ function exportFile() {
 function importFile(file) {
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => {
-    if (!window.confirm('הטעינה תחליף את ההתקדמות הנוכחית במכשיר הזה. להמשיך?')) return;
+  reader.onload = async () => {
     try {
-      progress.importData(String(reader.result));
+      const parsed = parseProgressFile(String(reader.result));
+      if (parsed.kind === 'all') {
+        const names = parsed.profiles.map((x) => x.entry.name).join(', ');
+        if (!window.confirm(`בקובץ: ${names}.\nילדים שכבר נמצאים במכשיר יקבלו את הנתונים מהקובץ, ושאר הילדים יישארו. להמשיך?`)) return;
+        profiles.importAll(parsed);
+      } else {
+        const into = await askImportTarget(parsed.state);
+        if (!into) return;
+        profiles.importSingle(parsed.state, { into });
+        parentsProfileId = profiles.activeId;
+      }
+      progress = profiles.active;
       showToast('ההתקדמות נטענה ✓');
       render();
     } catch (err) {
@@ -943,12 +1103,65 @@ function importFile(file) {
   reader.readAsText(file);
 }
 
-function resetProgress() {
-  if (!window.confirm('למחוק את כל ההתקדמות, הנקודות וההישגים? אי אפשר לבטל.')) return;
+// An old file holds one child: load it as a new child or into the active one.
+function askImportTarget(state) {
+  const fileName = typeof state.settings?.name === 'string' && state.settings.name.trim() ? state.settings.name.trim() : 'ילד/ה';
+  const active = profiles.entry(profiles.activeId);
+  return openDialog({
+    title: 'לאן לטעון את הקובץ?',
+    body: [h('p', {}, `בקובץ יש התקדמות של ${fileName}, מגרסה קודמת של האתר.`)],
+    actions: [
+      profiles.canAdd ? { label: `➕ ${fileName} כילד/ה חדש/ה`, value: 'new', className: 'btn-primary btn-import-new' } : null,
+      active ? { label: `לתוך ${active.name} (במקום ההתקדמות של ${active.name})`, value: 'active',
+        className: 'btn-secondary btn-import-active' } : null,
+      { label: 'ביטול', value: null, className: 'btn-ghost' },
+    ].filter(Boolean),
+  });
+}
+
+function resetProgress(p, child) {
+  if (!window.confirm(`למחוק את כל ההתקדמות, הנקודות וההישגים של ${child.name}? אי אפשר לבטל.`)) return;
   if (!window.confirm('בטוח? מומלץ לשמור קובץ התקדמות לפני כן.')) return;
-  progress.reset();
+  p.reset();
   showToast('ההתקדמות אופסה');
   render();
+}
+
+// ---------------------------------------------------------------- dialog
+
+// Modal with one button per action; resolves with the action's value, or
+// null when closed with Escape or by a screen change. An action with
+// `validate()` stays open while it returns a message.
+function openDialog({ title, body = [], actions }) {
+  return new Promise((resolve) => {
+    let result = null;
+    const msg = h('p', { class: 'dialog-msg', 'aria-live': 'polite' });
+    const buttons = actions.map((a) => h('button', { class: `btn ${a.className ?? 'btn-secondary'}`, type: 'button',
+      onclick: () => {
+        const problem = a.validate?.();
+        if (problem) {
+          msg.textContent = problem;
+          return;
+        }
+        result = a.value;
+        dialog.close();
+      } }, a.label));
+    const dialog = h('dialog', { class: 'dialog', 'aria-labelledby': 'dialog-title' },
+      h('h2', { class: 'dialog-title', id: 'dialog-title' }, title),
+      body,
+      msg,
+      h('div', { class: 'dialog-actions' }, buttons));
+    dialog.addEventListener('close', () => {
+      dialog.remove();
+      resolve(result);
+    });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  });
+}
+
+function closeDialogs() {
+  document.querySelectorAll('dialog.dialog[open]').forEach((d) => d.close());
 }
 
 // ---------------------------------------------------------------- toast
@@ -985,8 +1198,14 @@ watchHebrewVoice((available) => {
 });
 
 if (new URLSearchParams(location.search).has('e2e')) {
-  window.__e2e = { progress, startSession, startTest, go, get session() { return session; } };
+  window.__e2e = { profiles, store, startSession, startTest, go,
+    get progress() { return progress; }, get session() { return session; } };
 }
+
+// With several children the app opens on the chooser, so nobody practices on
+// a sibling's profile by accident.
+if (profiles.count > 1 && (location.hash === '' || location.hash === '#home')) history.replaceState(null, '', '#who');
 
 window.addEventListener('hashchange', render);
 render();
+store.appStarted();

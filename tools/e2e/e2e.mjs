@@ -41,11 +41,14 @@ function check(cond, msg) {
   return !!cond;
 }
 
-const STORAGE_KEY = 'gifted-prep:progress:v1';
+const STORAGE_KEY = 'gifted-prep:progress:v1'; // the single-child save from before profiles
+const INDEX_KEY = 'gifted-prep:profiles:v1';
+const PROFILE_KEY_PREFIX = 'gifted-prep:profile:v1:';
 const DEFAULT_PROFILE = { name: 'יונתן' }; // an old save: a name and no gender
 
-// `profile` seeds a saved name (skips onboarding) unless storage already has a
-// save; null starts as a first visit.
+// `profile` seeds an old single-child save (migrated into the first profile,
+// so onboarding is skipped) unless storage already has one; null starts as a
+// first visit.
 async function newPage(browser, viewport = VIEWPORTS.phone, { clock = false, profile = DEFAULT_PROFILE } = {}) {
   const context = await browser.newContext({ viewport, locale: 'he-IL', acceptDownloads: true, reducedMotion: 'reduce' });
   if (profile) {
@@ -227,7 +230,9 @@ async function flowCore(browser) {
   await open(page);
   r.homeReadyMs = Date.now() - t0;
   check(await page.evaluate(() => document.querySelector('#app').dataset.screen) === 'home', 'saved name skips onboarding');
-  check(await page.locator('.greeting').innerText() === 'שלום יונתן!', 'home greeting');
+  check(await page.locator('.greeting-text').innerText() === 'שלום יונתן!', 'home greeting');
+  check(await page.evaluate(() => window.__e2e.profiles.count) === 1, 'old save migrated into one profile');
+  check(await page.locator('.btn-switch').count() === 1, 'one child: home shows the switch button');
   check(await page.evaluate(() => window.__e2e.progress.settings.gender) === 'boy', 'old save without gender defaults to boy');
   check(await page.locator('.topic-card').count() === 3, 'home has 3 topic cards');
   check(await page.locator('.home-sub').innerText() === 'מוכן לאתגר של היום?', 'first-visit subtitle');
@@ -312,18 +317,26 @@ async function flowCore(browser) {
 
   check(await page.locator('.test-history').count() === 1, 'parents shows test history card');
 
-  // Settings: an empty name is refused, then name, gender, lengths and timer
-  await page.fill('.settings input.input[type=text]', '');
-  await page.locator('.settings input.input[type=text]').dispatchEvent('change');
+  check(await page.locator('.child-row').count() === 1 && await page.locator('.child-switcher').count() === 0,
+    'one child: children list without a switcher');
+
+  // Edit the child: an empty name is refused, then name and gender
+  await page.click('.child-row .btn-edit');
+  await page.waitForSelector('dialog.dialog[open]');
+  await page.fill('#edit-name', '');
+  await page.click('dialog .btn-primary');
+  check((await page.locator('.dialog-msg').innerText()).includes('ריק'), 'edit dialog refuses an empty name');
   check(await page.evaluate(() => window.__e2e.progress.settings.name) === 'יונתן', 'empty name is not saved');
-  check(await page.inputValue('.settings input.input[type=text]') === 'יונתן', 'empty name input restored');
-  await page.fill('.settings input.input[type=text]', 'נועה');
-  await page.locator('.settings input.input[type=text]').dispatchEvent('change');
-  await page.locator('.settings select').nth(0).selectOption('girl');
-  await page.locator('.settings select').nth(1).selectOption('5');
-  check(await page.locator('.settings select').nth(2).locator('option').allInnerTexts()
+  await page.fill('#edit-name', 'נועה');
+  await page.selectOption('#edit-gender', 'girl');
+  await page.click('dialog .btn-primary');
+  await page.waitForSelector('dialog.dialog', { state: 'detached' });
+
+  // Settings of this child: lengths and timer
+  await page.locator('.settings select').nth(0).selectOption('5');
+  check(await page.locator('.settings select').nth(1).locator('option').allInnerTexts()
     .then((o) => o.join(',') === '10 שאלות,15 שאלות,20 שאלות'), 'exam length options 10/15/20');
-  await page.locator('.settings select').nth(3).selectOption('30');
+  await page.locator('.settings select').nth(2).selectOption('30');
   await page.locator('.settings input[type=checkbox]').first().check();
   const settings = await page.evaluate(() => ({ ...window.__e2e.progress.settings }));
   r.settings = settings;
@@ -332,18 +345,18 @@ async function flowCore(browser) {
   await shot(page, 'flow_parents_after_settings');
 
   // Export
-  const [download] = await Promise.all([page.waitForEvent('download'), page.click('.row .btn-secondary >> nth=0')]);
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('.btn-export')]);
   const exportPath = path.join(OUT, 'export.json');
   await download.saveAs(exportPath);
   const exported = JSON.parse(fs.readFileSync(exportPath, 'utf8'));
-  const pointsBefore = exported.state.points;
-  r.export = { file: download.suggestedFilename(), points: pointsBefore, attempts: exported.state.totals.attempts };
-  check(exported.app === 'gifted-prep' && pointsBefore > 0, 'export JSON valid with points');
-  check(exported.state.settings.gender === 'girl', 'export carries gender');
+  const pointsBefore = exported.profiles[0].state.points;
+  r.export = { file: download.suggestedFilename(), points: pointsBefore, attempts: exported.profiles[0].state.totals.attempts };
+  check(exported.app === 'gifted-prep' && exported.profiles.length === 1 && pointsBefore > 0, 'export JSON valid with points');
+  check(exported.profiles[0].gender === 'girl' && exported.profiles[0].state.settings.gender === 'girl', 'export carries gender');
   check(!/amiad/.test(download.suggestedFilename()), `export file name is not personal: ${download.suggestedFilename()}`);
 
   // Reset (two confirms auto-accepted)
-  await page.click('.btn-danger');
+  await page.click('.btn-reset');
   await page.waitForFunction(() => window.__e2e.progress.state.points === 0);
   check(await page.locator('.stat b').first().innerText() === '0', 'reset shows 0 attempts');
   check(await page.evaluate(() => window.__e2e.progress.settings.name) === 'נועה', 'reset keeps settings');
@@ -356,7 +369,7 @@ async function flowCore(browser) {
   // Settings take effect + reload persistence
   await page.goto(`${BASE}?e2e`);
   await page.waitForSelector('.greeting');
-  check(await page.locator('.greeting').innerText() === 'שלום נועה!', 'name persists after reload');
+  check(await page.locator('.greeting-text').innerText() === 'שלום נועה!', 'name persists after reload');
   check(await page.locator('.mode-practice .section-title').innerText() === 'או בחרי נושא:', 'gender setting switches home text');
   const chip = await page.locator('.chip b').first().innerText();
   check(Number(chip) === pointsBefore, `points persist after reload ${chip} vs ${pointsBefore}`);
@@ -367,8 +380,17 @@ async function flowCore(browser) {
   check(await page.locator('.timer').count() === 1, 'timer shown when timedDefault on');
   check((await page.locator('.timer-fill').getAttribute('style')).includes('30000ms'), 'timer is 30s');
 
-  // Corrupt storage must not crash; the name is lost, so onboarding comes back
-  await page.evaluate((key) => localStorage.setItem(key, '{broken'), STORAGE_KEY);
+  // A corrupt index is rebuilt from the progress records
+  await page.evaluate((key) => localStorage.setItem(key, '{broken'), INDEX_KEY);
+  await page.goto(`${BASE}?e2e`);
+  await page.waitForSelector('.greeting');
+  check(await page.locator('.greeting-text').innerText() === 'שלום נועה!'
+    && Number(await page.locator('.chip b').first().innerText()) === pointsBefore, 'corrupt index rebuilt, nothing lost');
+
+  // Everything corrupt must not crash; the names are lost, so onboarding comes back
+  await page.evaluate(() => {
+    for (const k of Object.keys(localStorage)) if (k.startsWith('gifted-prep:')) localStorage.setItem(k, '{broken');
+  });
   await page.goto(`${BASE}?e2e`);
   await page.waitForSelector('.screen.welcome');
   check(await page.locator('.gender-btn').count() === 2, 'corrupt storage boots into onboarding');
@@ -417,11 +439,18 @@ async function flowOnboarding(browser) {
     await page.click(`.gender-btn[data-gender=${gender}]`);
     check(await page.getAttribute(`.gender-btn[data-gender=${gender}]`, 'aria-pressed') === 'true', 'gender button pressed');
     await shot(page, `${vpName}_00_welcome_${gender}`);
+    check(await page.locator('.avatar-btn').count() === 12, 'onboarding offers 12 avatars');
+    check(await page.locator('.avatar-btn[aria-pressed=true]').count() === 1, 'one avatar is preselected');
+    const avatar = gender === 'girl' ? '🦄' : '🐙';
+    await page.click(`.avatar-btn[data-avatar="${avatar}"]`);
+    await shot(page, `${vpName}_00_welcome_${gender}_avatar`);
     await page.click('.welcome-card button[type=submit]');
     await page.waitForSelector('.greeting');
     const settings = await page.evaluate(() => ({ ...window.__e2e.progress.settings }));
     check(settings.name === name && settings.gender === gender, `onboarding saved ${JSON.stringify(settings)}`);
-    check(await page.locator('.greeting').innerText() === `שלום ${name}!`, 'greeting uses the new name');
+    check(await page.locator('.greeting-text').innerText() === `שלום ${name}!`, 'greeting uses the new name');
+    check(await page.locator('.who-btn .avatar').innerText() === avatar, 'home header shows the chosen avatar');
+    check(await page.evaluate(() => window.__e2e.profiles.list.length) === 1, 'onboarding created one profile');
     const sub = await page.locator('.home-sub').innerText();
     check(sub === (gender === 'girl' ? 'מוכנה לאתגר של היום?' : 'מוכן לאתגר של היום?'), `gendered subtitle "${sub}"`);
     await shot(page, `${vpName}_01_home_${gender}`);
@@ -574,7 +603,7 @@ async function flowTestGirl(browser) {
   await page.waitForSelector('.screen.parents');
   check(await page.locator('.test-history tbody tr').count() === 1, 'parents list one test');
   check(await page.locator('.test-history .chart-col').count() === 1, 'parents chart one test');
-  check(await page.locator('.settings select').nth(0).inputValue() === 'girl', 'parents gender select shows girl');
+  check((await page.locator('.child-row .child-meta').innerText()).startsWith('בת'), 'parents children list shows girl');
   await context.close();
 }
 
@@ -604,6 +633,299 @@ async function flowBulk(browser) {
   report.bulk = { answered, perSkill };
   check(answered >= 150, `bulk answered ${answered}`);
   await context.close();
+}
+
+// ------------------------------------------------------------------ profiles
+
+const screenName = (page) => page.evaluate(() => document.querySelector('#app').dataset.screen);
+
+async function unlockParents(page) {
+  await page.evaluate(() => window.__e2e.go('parents'));
+  await page.waitForSelector('.screen.gate, .screen.parents');
+  if (await page.locator('.screen.gate').count()) {
+    const [a, b] = (await page.locator('.gate-q').innerText()).match(/\d+/g).map(Number);
+    await page.fill('.gate input', String(a * b));
+    await page.click('.gate button[type=submit]');
+  }
+  await page.waitForSelector('.screen.parents');
+}
+
+async function onboard(page, name, gender, avatar) {
+  await page.waitForSelector('.screen.welcome');
+  await page.fill('#welcome-name', name);
+  await page.click(`.gender-btn[data-gender=${gender}]`);
+  if (avatar) await page.click(`.avatar-btn[data-avatar="${avatar}"]`);
+  await page.click('.welcome-card button[type=submit]');
+  await page.waitForSelector('.greeting');
+}
+
+// Answers `n` practice questions through the UI and checks that each answer
+// is in localStorage right away, then leaves the session.
+async function practice(page, n, correct) {
+  await page.click('.mode-practice .btn-huge');
+  await page.waitForSelector('.screen.practice .choice');
+  for (let i = 0; i < n; i++) {
+    const before = await page.evaluate(() => window.__e2e.progress.state.totals.attempts);
+    await answer(page, correct);
+    const stored = await page.evaluate((prefix) => {
+      const rec = JSON.parse(localStorage.getItem(prefix + window.__e2e.profiles.activeId));
+      return rec.state.totals.attempts;
+    }, PROFILE_KEY_PREFIX);
+    check(stored === before + 1, `answer saved right away (${stored} vs ${before + 1})`);
+    await next(page);
+  }
+  await page.click('.practice .btn-back');
+  await page.waitForSelector('.greeting');
+}
+
+const childStats = (page) => page.evaluate(() => Object.fromEntries(window.__e2e.profiles.list.map((e) => {
+  const p = window.__e2e.profiles.progressFor(e.id);
+  return [e.name, { id: e.id, attempts: p.state.totals.attempts, points: p.state.points, session: p.settings.sessionLength,
+    avatar: e.avatar }];
+})));
+
+async function noHorizontalScroll(page, where) {
+  const sw = await page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  check(sw[0] <= sw[1] + 1, `${where} scrolls horizontally ${sw[0]}>${sw[1]}`);
+}
+
+// Two children on one device: create, practice with each, switch, isolation,
+// reload keeps the active child, parents edit/switch/delete, export/import.
+async function flowFamily(browser) {
+  const r = (report.flows.family = {});
+  const { context, page } = await newPage(browser, VIEWPORTS.phone, { profile: null });
+  await open(page);
+  await onboard(page, 'נועה', 'girl', '🦄');
+  check(await page.locator('.btn-switch').count() === 1, 'single child: switch button on home');
+  await practice(page, 3, true);
+
+  // Add a brother from the chooser
+  await page.click('.btn-switch');
+  await page.waitForSelector('.screen.who');
+  check(await page.locator('.profile-card[data-profile]').count() === 1, 'chooser lists one child');
+  await page.click('.profile-add');
+  await page.waitForSelector('.screen.welcome .btn-back');
+  check(await page.locator('.avatar-btn[aria-pressed=true]').getAttribute('data-avatar') !== '🦄', 'new child gets a free avatar');
+  await onboard(page, 'איתי', 'boy', '🐸');
+  check(await page.locator('.greeting-text').innerText() === 'שלום איתי!', 'new child is active');
+  check(await page.locator('.chip b').first().innerText() === '0', 'new child starts at 0 points');
+  check(await page.locator('.home-sub').innerText() === 'מוכן לאתגר של היום?', 'new child has his own day and gender');
+  await practice(page, 2, false);
+
+  let stats = await childStats(page);
+  r.afterPractice = stats;
+  check(stats['נועה'].attempts === 3 && stats['איתי'].attempts === 2, `isolation of attempts ${JSON.stringify(stats)}`);
+  check(stats['נועה'].points > 0 && stats['איתי'].points === 0, 'isolation of points');
+
+  // Switch back by tapping the header
+  await page.click('.who-btn');
+  await page.waitForSelector('.screen.who');
+  check(await page.locator('.profile-card[data-profile]').count() === 2, 'chooser lists two children');
+  const noaCard = page.locator(`.profile-card[data-profile="${stats['נועה'].id}"]`);
+  check((await noaCard.locator('.profile-points').innerText()).includes(String(stats['נועה'].points)), 'chooser shows points');
+  await noaCard.click();
+  await page.waitForSelector('.greeting');
+  check(await page.locator('.greeting-text').innerText() === 'שלום נועה!', 'switched to Noa');
+  check(Number(await page.locator('.chip b').first().innerText()) === stats['נועה'].points, 'Noa points on home');
+  check(await page.locator('.home-sub').innerText() === 'איזה כיף שחזרת! עוד סיבוב?', 'Noa practiced today');
+
+  // Reload: two children open on the chooser, Noa stays the active one
+  await page.goto(`${BASE}?e2e`);
+  await page.waitForSelector('.screen');
+  check(await screenName(page) === 'who', 'several children: app opens on the chooser');
+  check(await page.evaluate(() => window.__e2e.profiles.activeId) === stats['נועה'].id, 'active child persists across reload');
+  check(await noaCard.getAttribute('aria-current') === 'true', 'chooser marks the last child');
+  await page.evaluate(() => window.__e2e.go('achievements'));
+  await page.waitForSelector('.screen.achievements');
+  await page.evaluate(() => window.__e2e.go('home'));
+  check(await page.locator('.greeting-text').innerText() === 'שלום נועה!', 'home after reload is still Noa');
+
+  // Parents: per-child stats and settings, edit, delete, export, import
+  await unlockParents(page);
+  check(await page.locator('.child-row').count() === 2, 'parents lists two children');
+  check(await page.locator('.switch-chip').count() === 2, 'parents has a child switcher');
+  check(await page.locator('.stat b').first().innerText() === '3', 'parents starts on the active child');
+  await page.click(`.switch-chip[data-profile="${stats['איתי'].id}"]`);
+  check(await page.locator('.stat b').first().innerText() === '2', 'switcher shows the brother');
+  check((await page.locator('.settings').locator('..').locator('h2').innerText()) === 'הגדרות של איתי', 'settings title names the child');
+  await page.locator('.settings select').nth(0).selectOption('5');
+  stats = await childStats(page);
+  check(stats['איתי'].session === 5 && stats['נועה'].session === 10, `settings are per child ${JSON.stringify(stats)}`);
+  check(await page.evaluate(() => window.__e2e.progress.settings.name) === 'נועה', 'viewing stats does not switch the active child');
+
+  await page.click(`.child-row[data-profile="${stats['איתי'].id}"] .btn-edit`);
+  await page.waitForSelector('dialog.dialog[open]');
+  await page.fill('#edit-name', 'איתן');
+  await page.click('dialog .avatar-btn[data-avatar="🐙"]');
+  await page.click('dialog .btn-primary');
+  await page.waitForSelector('dialog.dialog', { state: 'detached' });
+  check((await page.locator(`.child-row[data-profile="${stats['איתי'].id}"] .child-name`).innerText()) === 'איתן', 'edit renames');
+  stats = await childStats(page);
+  check(stats['איתן']?.avatar === '🐙', 'edit changes the avatar');
+
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('.btn-export')]);
+  const exportPath = path.join(OUT, 'export_family.json');
+  await download.saveAs(exportPath);
+  const exported = JSON.parse(fs.readFileSync(exportPath, 'utf8'));
+  check(exported.profiles.length === 2 && exported.version === 2, 'export holds both children');
+
+  // Delete: cancel first, then confirm
+  const itanRow = `.child-row[data-profile="${stats['איתן'].id}"]`;
+  await page.click(`${itanRow} .btn-delete`);
+  await page.waitForSelector('dialog.dialog[open]');
+  check((await page.locator('dialog .dialog-title').innerText()) === 'למחוק את איתן?', 'delete dialog names the child');
+  await page.click('dialog .btn-secondary');
+  await page.waitForSelector('dialog.dialog', { state: 'detached' });
+  check(await page.locator('.child-row').count() === 2, 'cancel keeps the child');
+  await page.click(`${itanRow} .btn-delete`);
+  await page.click('dialog .btn-confirm-delete');
+  await page.waitForFunction(() => document.querySelectorAll('.child-row').length === 1);
+  check(await page.locator('.child-switcher').count() === 0, 'one child left: no switcher');
+  check(await page.evaluate((k) => localStorage.getItem(k), PROFILE_KEY_PREFIX + stats['איתן'].id) === null, 'record deleted');
+
+  // Import all: the deleted child comes back with his progress
+  await page.setInputFiles('#import-file', exportPath);
+  await page.waitForFunction(() => document.querySelectorAll('.child-row').length === 2);
+  stats = await childStats(page);
+  check(stats['איתן']?.attempts === 2 && stats['נועה'].attempts === 3, `import all restores ${JSON.stringify(stats)}`);
+
+  // An old one-child file: as a new child, then into the active child
+  const oldFile = path.join(OUT, 'old_single.json');
+  fs.writeFileSync(oldFile, JSON.stringify({ app: 'gifted-prep', exportedAt: '2026-10-01T10:00:00.000Z',
+    state: { version: 1, settings: { name: 'דנה', gender: 'girl' }, points: 77, totals: { attempts: 9, correct: 7 } } }));
+  await page.setInputFiles('#import-file', oldFile);
+  await page.waitForSelector('dialog.dialog[open] .btn-import-new');
+  await shot(page, 'phone_import_choice');
+  await page.click('dialog .btn-import-new');
+  await page.waitForFunction(() => document.querySelectorAll('.child-row').length === 3);
+  stats = await childStats(page);
+  check(stats['דנה']?.points === 77 && await page.evaluate(() => window.__e2e.progress.settings.name) === 'דנה',
+    'old file imported as a new active child');
+  check(await page.locator('.stat b').first().innerText() === '9', 'parents shows the imported child');
+  await page.evaluate((id) => window.__e2e.profiles.switchTo(id), stats['נועה'].id);
+  await page.evaluate(() => window.__e2e.go('home'));
+  await unlockParents(page);
+  await page.setInputFiles('#import-file', oldFile);
+  await page.waitForSelector('dialog.dialog[open] .btn-import-active');
+  await page.click('dialog .btn-import-active');
+  await page.waitForFunction(() => window.__e2e.profiles.progressFor(window.__e2e.profiles.activeId).state.points === 77);
+  stats = await childStats(page);
+  check(stats['נועה']?.attempts === 9 && Object.keys(stats).length === 3, `old file into the active child keeps her name ${JSON.stringify(stats)}`);
+
+  // Delete everyone: back to onboarding
+  for (let i = 0; i < 3; i++) {
+    await page.click('.child-row .btn-delete >> nth=0');
+    await page.click('dialog .btn-confirm-delete');
+    await page.waitForFunction((left) => document.querySelectorAll('.child-row').length === left
+      || document.querySelector('#app').dataset.screen === 'welcome', 2 - i);
+  }
+  await page.waitForSelector('.screen.welcome');
+  check(await page.evaluate(() => window.__e2e.profiles.count) === 0, 'all children deleted');
+  await page.goto(`${BASE}?e2e`);
+  await page.waitForSelector('.screen.welcome');
+  check(await page.locator('.btn-back').count() === 0, 'first-visit onboarding has no back button');
+  await context.close();
+}
+
+// An old single-child save with real progress becomes one profile, intact.
+async function flowMigration(browser) {
+  const r = (report.flows.migration = {});
+  const { context: c1, page: p1 } = await newPage(browser, VIEWPORTS.phone, { profile: { name: 'מאיה', gender: 'girl' } });
+  await open(p1);
+  await practice(p1, 4, false);
+  const legacy = await p1.evaluate(() => {
+    const p = window.__e2e.progress;
+    const qs = p.buildTest({ length: 6 });
+    const answers = qs.map((q, i) => {
+      const correct = i % 2 === 0;
+      p.recordAnswer(q, { correct, timeMs: 3000, timeLimitMs: 45000, requeue: false });
+      return { question: q, correct, timedOut: false, timeMs: 3000 };
+    });
+    p.finishTest(answers);
+    p.updateSettings({ sessionLength: 15, sound: false });
+    return JSON.parse(JSON.stringify(p.snapshot()));
+  });
+  await c1.close();
+  check(legacy.points > 0 && legacy.retryQueue.length > 0 && legacy.testHistory.length === 1
+    && Object.keys(legacy.badges).length > 0 && legacy.seen.length >= 10, 'legacy save has real progress');
+
+  const context = await browser.newContext({ viewport: VIEWPORTS.phone, locale: 'he-IL', reducedMotion: 'reduce' });
+  await context.addInitScript(({ key, text }) => {
+    if (!localStorage.getItem('e2e-seeded')) {
+      localStorage.setItem(key, text);
+      localStorage.setItem('e2e-seeded', '1');
+    }
+  }, { key: STORAGE_KEY, text: JSON.stringify(legacy) });
+  const page = await context.newPage();
+  page.on('pageerror', (e) => report.pageErrors.push(String(e)));
+  await open(page);
+  check(await screenName(page) === 'home', 'migrated single child goes straight to home');
+  const after = await page.evaluate(({ indexKey, prefix }) => {
+    const index = JSON.parse(localStorage.getItem(indexKey));
+    const rec = JSON.parse(localStorage.getItem(prefix + index.activeId));
+    return { index, rec, live: JSON.parse(JSON.stringify(window.__e2e.progress.snapshot())) };
+  }, { indexKey: INDEX_KEY, prefix: PROFILE_KEY_PREFIX });
+  r.index = after.index;
+  check(after.index.profiles.length === 1 && after.index.profiles[0].name === 'מאיה' && after.index.profiles[0].gender === 'girl',
+    `one migrated profile ${JSON.stringify(after.index.profiles)}`);
+  check(JSON.stringify(after.live) === JSON.stringify(legacy), 'migrated state is identical to the old save');
+  check(after.rec.rev >= 1 && after.rec.updatedAt > 0 && after.rec.state.points === legacy.points, 'record carries rev and updatedAt');
+  check(await page.locator('.greeting-text').innerText() === 'שלום מאיה!', 'migrated greeting');
+  check(Number(await page.locator('.chip b').first().innerText()) === legacy.points, 'migrated points on home');
+  check(await page.evaluate((k) => localStorage.getItem(k), STORAGE_KEY) === JSON.stringify(legacy), 'old save kept as a backup');
+  await page.reload();
+  await page.waitForSelector('.greeting');
+  check(await page.evaluate(() => window.__e2e.profiles.count) === 1, 'no second migration on reload');
+  await context.close();
+}
+
+// Chooser, onboarding with an avatar, home header and the parents children
+// section, on phone and desktop.
+async function profileScreenshots(browser) {
+  for (const vpName of ['phone', 'desktop']) {
+    const { context, page } = await newPage(browser, VIEWPORTS[vpName], { profile: null });
+    await open(page);
+    await onboard(page, 'נועה', 'girl', '🦄');
+    await page.evaluate(() => {
+      const { profiles } = window.__e2e;
+      for (const [name, gender] of [['איתי', 'boy'], ['מאיה בת-שבע', 'girl'], ['יונתן', 'boy']]) profiles.create({ name, gender });
+      for (const e of profiles.list) {
+        const p = profiles.progressFor(e.id);
+        p.state.points = 40 * e.name.length;
+        p.save();
+      }
+    });
+    await page.goto(`${BASE}?e2e`);
+    await page.waitForSelector('.screen.who');
+    await shot(page, `${vpName}_profiles_chooser`);
+    await noHorizontalScroll(page, `${vpName} chooser`);
+    await page.click('.profile-add');
+    await page.waitForSelector('.screen.welcome');
+    await page.fill('#welcome-name', 'דנה');
+    await page.click('.gender-btn[data-gender=girl]');
+    await page.click('.avatar-btn[data-avatar="🐰"]');
+    await shot(page, `${vpName}_profiles_onboarding_avatar`);
+    await noHorizontalScroll(page, `${vpName} onboarding`);
+    await page.click('.welcome-card button[type=submit]');
+    await page.waitForSelector('.greeting');
+    await page.waitForTimeout(100);
+    await page.screenshot({ path: path.join(OUT, `${vpName}_profiles_home_header.png`), clip: { x: 0, y: 0, width: VIEWPORTS[vpName].width, height: 260 } });
+    await noHorizontalScroll(page, `${vpName} home`);
+    await unlockParents(page);
+    await page.locator('.card.children').screenshot({ path: path.join(OUT, `${vpName}_profiles_parents_children.png`) });
+    await shot(page, `${vpName}_profiles_parents`);
+    await noHorizontalScroll(page, `${vpName} parents`);
+    await page.click('.child-row .btn-edit >> nth=1');
+    await page.waitForSelector('dialog.dialog[open]');
+    await page.screenshot({ path: path.join(OUT, `${vpName}_profiles_edit_dialog.png`) });
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('dialog.dialog', { state: 'detached' });
+    await page.click('.child-row .btn-delete >> nth=1');
+    await page.waitForSelector('dialog.dialog[open]');
+    await page.screenshot({ path: path.join(OUT, `${vpName}_profiles_delete_dialog.png`) });
+    await page.click('dialog .btn-secondary');
+    await context.close();
+  }
 }
 
 // ------------------------------------------------------------------ screenshots
@@ -693,7 +1015,8 @@ async function perf(browser) {
 const browser = await chromium.launch();
 try {
   for (const [name, fn] of [['perf', perf], ['onboarding', flowOnboarding], ['core', flowCore], ['exam', flowExam],
-    ['examGirl', flowTestGirl], ['bulk', flowBulk], ['screenshots', screenshots]]) {
+    ['examGirl', flowTestGirl], ['family', flowFamily], ['migration', flowMigration], ['bulk', flowBulk],
+    ['screenshots', screenshots], ['profileShots', profileScreenshots]]) {
     if (args.only && !args.only.split(',').includes(name)) continue;
     const t = Date.now();
     try {

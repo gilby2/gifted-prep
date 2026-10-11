@@ -1,11 +1,11 @@
-// Adaptive progress engine: per-skill stats, level adaptation, skill picking,
-// question freshness, mistake re-queueing, points, streaks and badges.
-// Pure logic - no DOM. Storage and clock are injected so node tests can run it.
+// Adaptive progress engine for one child: per-skill stats, level adaptation,
+// skill picking, question freshness, mistake re-queueing, points, streaks and
+// badges. Pure logic - no DOM. Persistence and clock are injected so node
+// tests can run it; profiles.js owns loading and saving.
 
 import { createRng } from '../core/random.js';
 import { checkQuestion } from './contract.js';
 
-export const STORAGE_KEY = 'gifted-prep:progress:v1';
 export const SCHEMA_VERSION = 1;
 export const EXPORT_APP_ID = 'gifted-prep';
 
@@ -45,21 +45,6 @@ export const SETTING_LIMITS = Object.freeze({
   examLength: [5, 40],
   timerSeconds: [15, 120],
 });
-
-// ---------------------------------------------------------------- storage
-
-export function safeLocalStorage() {
-  try {
-    const ls = globalThis.localStorage;
-    if (!ls) return null;
-    const probe = `${STORAGE_KEY}:probe`;
-    ls.setItem(probe, '1');
-    ls.removeItem(probe);
-    return ls;
-  } catch {
-    return null;
-  }
-}
 
 // ---------------------------------------------------------------- dates
 
@@ -313,13 +298,14 @@ export function badgeDefinitions(topics) {
 // ---------------------------------------------------------------- engine
 
 export class Progress {
-  constructor({ topics = [], storage = null, now = () => Date.now(), state = null } = {}) {
+  // `persist(state)` saves the state and returns true on success.
+  constructor({ topics = [], persist = null, now = () => Date.now(), state = null } = {}) {
     this.topics = topics;
-    this.storage = storage;
+    this.persist = persist;
     this.now = now;
     this.brokenSkills = new Set();
     this.lastError = null;
-    this.state = state ? normalizeState(state, now()) : this._load();
+    this.state = state ? normalizeState(state, now()) : defaultState(now());
     this._rebuildSeen();
     this.badges = badgeDefinitions(topics);
 
@@ -335,23 +321,17 @@ export class Progress {
 
   // ---- persistence
 
-  _load() {
-    if (!this.storage) return defaultState(this.now());
-    try {
-      const raw = this.storage.getItem(STORAGE_KEY);
-      return raw ? normalizeState(JSON.parse(raw), this.now()) : defaultState(this.now());
-    } catch (err) {
-      this.lastError = `load failed: ${err}`;
-      return defaultState(this.now());
-    }
+  // The state with the seen-question LRU written back into it.
+  snapshot() {
+    this.state.seen = [...this.seenMap.entries()];
+    return this.state;
   }
 
   save() {
-    this.state.seen = [...this.seenMap.entries()];
-    if (!this.storage) return false;
+    this.snapshot();
+    if (!this.persist) return false;
     try {
-      this.storage.setItem(STORAGE_KEY, JSON.stringify(this.state));
-      return true;
+      return this.persist(this.state);
     } catch (err) {
       this.lastError = `save failed: ${err}`;
       return false;
@@ -362,34 +342,6 @@ export class Progress {
     this.seenMap = new Map();
     const sorted = [...this.state.seen].sort((a, b) => a[1] - b[1]);
     for (const [key, stamp] of sorted) this.seenMap.set(key, stamp);
-  }
-
-  exportData() {
-    this.state.seen = [...this.seenMap.entries()];
-    return JSON.stringify({
-      app: EXPORT_APP_ID,
-      exportedAt: new Date(this.now()).toISOString(),
-      state: this.state,
-    });
-  }
-
-  // Throws an Error with a Hebrew message if the file is not a progress file.
-  importData(text) {
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error('הקובץ אינו קובץ התקדמות תקין (JSON שגוי).');
-    }
-    if (!isObj(parsed) || parsed.app !== EXPORT_APP_ID || !isObj(parsed.state)) {
-      throw new Error('הקובץ אינו קובץ התקדמות של האפליקציה.');
-    }
-    if (num(parsed.state.version, 0) > SCHEMA_VERSION) {
-      throw new Error('הקובץ נוצר בגרסה חדשה יותר של האפליקציה.');
-    }
-    this.state = normalizeState(parsed.state, this.now());
-    this._rebuildSeen();
-    this.save();
   }
 
   reset({ keepSettings = true } = {}) {

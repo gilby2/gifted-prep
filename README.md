@@ -6,7 +6,9 @@
 
 ## מה יש באתר
 
-- **היכרות** - בכניסה הראשונה הילד או הילדה כותבים שם ובוחרים "אני בן" או "אני בת". כל הטקסטים באתר פונים בלשון המתאימה.
+- **היכרות** - בכניסה הראשונה הילד או הילדה כותבים שם, בוחרים "אני בן" או "אני בת" ובוחרים דמות. כל הטקסטים באתר פונים בלשון המתאימה.
+- **כמה ילדים במכשיר אחד** - עד 8 ילדים, לכל אחד התקדמות והגדרות משלו. כשיש יותר מילד אחד, האתר נפתח במסך "מי מתאמן היום?".
+  לחיצה על השם בראש מסך הבית (או על "החלפת ילד/ה") פותחת את מסך הבחירה.
 - **אימון** - בלי שעון (אפשר להפעיל בהגדרות), משוב והסבר אחרי כל שאלה, ושאלות שהיו בהן טעויות חוזרות בהמשך.
   - **אימון מעורב** - האתר בוחר נושאים לפי מה שהכי כדאי לחזק ומה שלא תורגל זמן מה.
   - **אימון לפי נושא** - שלושה כרטיסי נושא עם פס התקדמות.
@@ -15,9 +17,11 @@
 - **שבחים** - גם על חשיבה ("איזה ראש!") וגם על מאמץ ודרך ("חשבת לאט ובדקת – מצוין!"), בלי לחזור על אותו משפט פעמיים ברצף.
 - **הישגים** - תגים שנפתחים בדרך.
 - **אזור הורים** - מוגן בתרגיל כפל. דיוק ורמה לכל מיומנות, 3 המיומנויות החלשות, גרף תרגול יומי,
-  היסטוריית מבחנים לדוגמה (גרף וטבלה לפי נושא), הגדרות (שם, בן/בת, אורך מבחן, זמן לשאלה), גיבוי ושחזור התקדמות, ואיפוס.
+  היסטוריית מבחנים לדוגמה (גרף וטבלה לפי נושא), הגדרות (אורך מבחן, זמן לשאלה), גיבוי ושחזור התקדמות, ואיפוס.
+  הנתונים וההגדרות מוצגים לכל ילד בנפרד (בוחרים ילד בראש המסך), ובחלק "ילדים" אפשר להוסיף, לערוך (שם, בן/בת, דמות) ולמחוק.
 
-ההתקדמות נשמרת בדפדפן (localStorage) בלבד. כדי לעבור למכשיר אחר: אזור הורים, "שמירת קובץ התקדמות", ואז "טעינת קובץ התקדמות" במכשיר השני.
+ההתקדמות נשמרת בדפדפן (localStorage) בלבד, אחרי כל תשובה. כדי לעבור למכשיר אחר: אזור הורים, "שמירת קובץ התקדמות" (קובץ אחד לכל הילדים),
+ואז "טעינת קובץ התקדמות" במכשיר השני. אפשר לטעון גם קובץ ישן של ילד אחד, כילד חדש או לתוך הילד הפעיל.
 
 ## הרצה מקומית
 
@@ -78,7 +82,9 @@ css/style.css           עיצוב (RTL, מותאם לטלפון, טאבלט ו�
 js/core/random.js       מחולל מספרים אקראיים עם seed
 js/core/svg.js          עזרים לציור צורות
 js/generators/          מחוללי השאלות לפי נושא + index.js (רישום)
-js/app/progress.js      מנוע ההתקדמות (ללא DOM, נבדק ב-node)
+js/app/progress.js      מנוע ההתקדמות של ילד אחד (ללא DOM, נבדק ב-node)
+js/app/profiles.js      הילדים במכשיר: יצירה, החלפה, מחיקה, מעבר מהשמירה הישנה, ייצוא וייבוא
+js/app/store.js         השכבה היחידה שניגשת ל-localStorage, עם נקודות חיבור לסנכרון עתידי
 js/app/main.js          המסכים והניווט
 tools/                  בדיקות
 ```
@@ -93,7 +99,13 @@ has masculine and feminine forms (`[m, f]` pairs resolved by `genderText`). Vani
 per skill from a seeded RNG; `js/app/progress.js` adapts the level per skill (up after 4 of the last 5
 correct, down after 3 misses in a row), picks skills by weakness and staleness, avoids recently seen
 questions (3000-key LRU), re-queues mistakes (a fresh variant and the exact question), and tracks
-points, daily streak and badges in `localStorage` with JSON export/import. There are two modes: practice
+points, daily streak and badges. Up to 8 children share a device, each with their own progress and
+settings (`js/app/profiles.js`). All persistence goes through `js/app/store.js`: a profiles index
+(`gifted-prep:profiles:v1`) plus one record per child (`gifted-prep:profile:v1:<id>` =
+`{ id, rev, updatedAt, state }`), with no-op sync hooks (`onAppStart`, `onSaved`, `onIndexSaved`,
+`onDeleted`) for a future cloud adapter. The old single-child key `gifted-prep:progress:v1` is migrated
+into the first profile once and kept as a backup. Export writes all children in one JSON file; old
+single-child exports still import, as a new child or into the active one. There are two modes: practice
 (feedback and explanation after each question) and a test simulation (a fixed, topic-balanced set with a
 per-question timer, no feedback until a results screen with a per-topic breakdown and a mistakes review;
 the mistakes are then re-queued for practice and the result is kept in a test history for parents).
